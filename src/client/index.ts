@@ -16,6 +16,105 @@ import {
 } from "../types/index.js";
 import fetch from "node-fetch";
 
+// Constantes pour les limites Notion
+const RICH_TEXT_CHAR_LIMIT = 2000;
+const RICH_TEXT_ARRAY_LIMIT = 100;
+
+// Block types qui contiennent des rich_text arrays
+const RICH_TEXT_BLOCK_TYPES = [
+  "paragraph",
+  "heading_1",
+  "heading_2",
+  "heading_3",
+  "bulleted_list_item",
+  "numbered_list_item",
+  "to_do",
+  "toggle",
+  "callout",
+  "quote",
+  "code",
+];
+
+/**
+ * Split un texte en chunks de taille maximale, sans couper les surrogate pairs
+ */
+function chunkText(text: string, limit: number = RICH_TEXT_CHAR_LIMIT): string[] {
+  if (text.length <= limit) return [text];
+
+  const chunks: string[] = [];
+  let i = 0;
+
+  while (i < text.length) {
+    let end = Math.min(i + limit, text.length);
+
+    // Ne pas couper les surrogate pairs (emoji, caractères Unicode rares)
+    if (
+      end < text.length &&
+      text.charCodeAt(end - 1) >= 0xd800 &&
+      text.charCodeAt(end - 1) <= 0xdbff
+    ) {
+      end--;
+    }
+
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+
+  return chunks;
+}
+
+/**
+ * Split un rich_text item en N items si son content dépasse 2000 chars
+ */
+function chunkRichTextItem(
+  item: RichTextItemResponse
+): RichTextItemResponse[] {
+  if (
+    item.type !== "text" ||
+    !item.text?.content ||
+    item.text.content.length <= RICH_TEXT_CHAR_LIMIT
+  ) {
+    return [item];
+  }
+
+  return chunkText(item.text.content).map((chunk) => ({
+    ...item,
+    text: { ...item.text!, content: chunk },
+    plain_text: chunk,
+  }));
+}
+
+/**
+ * Traite un array rich_text entier : chunk les items trop longs et cap à 100 elements
+ */
+function chunkRichTextArray(
+  richText: RichTextItemResponse[]
+): RichTextItemResponse[] {
+  const result = richText.flatMap(chunkRichTextItem);
+  return result.slice(0, RICH_TEXT_ARRAY_LIMIT);
+}
+
+/**
+ * Traite récursivement les rich_text dans un block et ses children
+ */
+function chunkBlockRichText(block: any): any {
+  if (!block?.type) return block;
+
+  const typeData = block[block.type];
+
+  // Chunk le rich_text du block si présent
+  if (typeData?.rich_text && Array.isArray(typeData.rich_text)) {
+    typeData.rich_text = chunkRichTextArray(typeData.rich_text);
+  }
+
+  // Traitement récursif des children
+  if (typeData?.children && Array.isArray(typeData.children)) {
+    typeData.children = typeData.children.map(chunkBlockRichText);
+  }
+
+  return block;
+}
+
 export class NotionClientWrapper {
   private notionToken: string;
   private baseUrl: string = "https://api.notion.com/v1";
@@ -34,7 +133,8 @@ export class NotionClientWrapper {
     block_id: string,
     children: Partial<BlockResponse>[]
   ): Promise<BlockResponse> {
-    const body = { children };
+    const chunkedChildren = children.map(chunkBlockRichText);
+    const body = { children: chunkedChildren };
 
     const response = await fetch(
       `${this.baseUrl}/blocks/${block_id}/children`,
@@ -90,10 +190,12 @@ export class NotionClientWrapper {
     block_id: string,
     block: Partial<BlockResponse>
   ): Promise<BlockResponse> {
+    const chunkedBlock = chunkBlockRichText(block);
+
     const response = await fetch(`${this.baseUrl}/blocks/${block_id}`, {
       method: "PATCH",
       headers: this.headers,
-      body: JSON.stringify(block),
+      body: JSON.stringify(chunkedBlock),
     });
 
     return response.json();
@@ -251,7 +353,8 @@ export class NotionClientWrapper {
     discussion_id?: string,
     rich_text?: RichTextItemResponse[]
   ): Promise<CommentResponse> {
-    const body: Record<string, any> = { rich_text };
+    const chunkedRichText = rich_text ? chunkRichTextArray(rich_text) : rich_text;
+    const body: Record<string, any> = { rich_text: chunkedRichText };
     if (parent) {
       body.parent = parent;
     }
