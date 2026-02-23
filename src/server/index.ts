@@ -56,9 +56,12 @@ export async function startServer(
                 "Missing required arguments: block_id and children"
               );
             }
+            const children = Array.isArray(args.children)
+              ? args.children
+              : JSON.parse(args.children as unknown as string);
             response = await notionClient.appendBlockChildren(
               args.block_id,
-              args.children
+              children
             );
             break;
           }
