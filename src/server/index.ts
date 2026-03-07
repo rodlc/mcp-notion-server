@@ -212,9 +212,13 @@ export async function startServer(
           case "notion_create_database_item": {
             const args = request.params
               .arguments as unknown as args.CreateDatabaseItemArgs;
+            const properties =
+              typeof args.properties === "string"
+                ? JSON.parse(args.properties)
+                : args.properties;
             response = await notionClient.createDatabaseItem(
               args.database_id,
-              args.properties
+              properties
             );
             break;
           }
