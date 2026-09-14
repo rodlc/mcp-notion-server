@@ -114,13 +114,22 @@ function stringToRichText(
   value: unknown,
 ): RichTextItemResponse[] {
   const content = expectString(propertyName, value);
-  return [
-    {
-      type: "text",
-      text: { content },
-      plain_text: content,
-    },
-  ];
+  const LIMIT = 2000;
+  if (content.length <= LIMIT) {
+    return [{ type: "text", text: { content }, plain_text: content }];
+  }
+  const chunks: RichTextItemResponse[] = [];
+  let i = 0;
+  while (i < content.length) {
+    let end = Math.min(i + LIMIT, content.length);
+    if (end < content.length && content.charCodeAt(end - 1) >= 0xd800 && content.charCodeAt(end - 1) <= 0xdbff) {
+      end--;
+    }
+    const chunk = content.slice(i, end);
+    chunks.push({ type: "text", text: { content: chunk }, plain_text: chunk });
+    i = end;
+  }
+  return chunks.slice(0, 100);
 }
 
 function buildDateValue(

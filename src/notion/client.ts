@@ -23,6 +23,79 @@ import type {
 
 type NotionJsonObject = Record<string, unknown>;
 
+const RICH_TEXT_CHAR_LIMIT = 2000;
+const RICH_TEXT_ARRAY_LIMIT = 100;
+
+const RICH_TEXT_BLOCK_TYPES = [
+  "paragraph",
+  "heading_1",
+  "heading_2",
+  "heading_3",
+  "bulleted_list_item",
+  "numbered_list_item",
+  "to_do",
+  "toggle",
+  "callout",
+  "quote",
+  "code",
+];
+
+function chunkText(text: string, limit: number = RICH_TEXT_CHAR_LIMIT): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + limit, text.length);
+    if (
+      end < text.length &&
+      text.charCodeAt(end - 1) >= 0xd800 &&
+      text.charCodeAt(end - 1) <= 0xdbff
+    ) {
+      end--;
+    }
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+
+function chunkRichTextItem(item: RichTextItemResponse): RichTextItemResponse[] {
+  if (
+    item.type !== "text" ||
+    !item.text?.content ||
+    item.text.content.length <= RICH_TEXT_CHAR_LIMIT
+  ) {
+    return [item];
+  }
+  return chunkText(item.text.content).map((chunk) => ({
+    ...item,
+    text: { ...item.text!, content: chunk },
+    plain_text: chunk,
+  }));
+}
+
+export function chunkRichTextArray(
+  richText: RichTextItemResponse[],
+): RichTextItemResponse[] {
+  const result = richText.flatMap(chunkRichTextItem);
+  return result.slice(0, RICH_TEXT_ARRAY_LIMIT);
+}
+
+function chunkBlockRichText(block: Record<string, unknown>): Record<string, unknown> {
+  if (!block?.type) return block;
+  const blockType = block.type as string;
+  const typeData = block[blockType] as Record<string, unknown> | undefined;
+  if (!typeData) return block;
+
+  if (typeData.rich_text && Array.isArray(typeData.rich_text)) {
+    typeData.rich_text = chunkRichTextArray(typeData.rich_text as RichTextItemResponse[]);
+  }
+  if (typeData.children && Array.isArray(typeData.children)) {
+    typeData.children = (typeData.children as Record<string, unknown>[]).map(chunkBlockRichText);
+  }
+  return block;
+}
+
 export type NotionClientOptions = {
   timeoutMs?: number;
   maxRetries?: number;
@@ -113,7 +186,8 @@ export class NotionClientWrapper {
     children: Partial<BlockResponse>[],
     position?: AppendBlockChildrenPosition,
   ): Promise<BlockResponse> {
-    const body: NotionJsonObject = { children };
+    const chunkedChildren = children.map((c) => chunkBlockRichText(c as Record<string, unknown>)) as Partial<BlockResponse>[];
+    const body: NotionJsonObject = { children: chunkedChildren };
     if (position) body.position = position;
 
     return this.request<BlockResponse>(`/blocks/${block_id}/children`, {
@@ -155,9 +229,10 @@ export class NotionClientWrapper {
     block_id: string,
     block: Partial<BlockResponse>,
   ): Promise<BlockResponse> {
+    const chunkedBlock = chunkBlockRichText(block as Record<string, unknown>) as Partial<BlockResponse>;
     return this.request<BlockResponse>(`/blocks/${block_id}`, {
       method: "PATCH",
-      body: JSON.stringify(block),
+      body: JSON.stringify(chunkedBlock),
     });
   }
 
@@ -308,7 +383,8 @@ export class NotionClientWrapper {
     discussion_id?: string,
     rich_text?: RichTextItemResponse[],
   ): Promise<CommentResponse> {
-    const body: NotionJsonObject = { rich_text };
+    const chunkedRichText = rich_text ? chunkRichTextArray(rich_text) : rich_text;
+    const body: NotionJsonObject = { rich_text: chunkedRichText };
     if (parent) {
       body.parent = parent;
     }

@@ -420,13 +420,20 @@ function richTextBlock(
 }
 
 function textToRichText(text: string): RichTextItemResponse[] {
-  return [
-    {
-      type: "text",
-      text: {
-        content: text,
-      },
-      plain_text: text,
-    },
-  ];
+  const LIMIT = 2000;
+  if (text.length <= LIMIT) {
+    return [{ type: "text", text: { content: text }, plain_text: text }];
+  }
+  const chunks: RichTextItemResponse[] = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + LIMIT, text.length);
+    if (end < text.length && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) {
+      end--;
+    }
+    const chunk = text.slice(i, end);
+    chunks.push({ type: "text", text: { content: chunk }, plain_text: chunk });
+    i = end;
+  }
+  return chunks.slice(0, 100);
 }

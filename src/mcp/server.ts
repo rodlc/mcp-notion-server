@@ -61,6 +61,8 @@ import {
   searchTool,
 } from "../tools/discovery/definitions.js";
 import { discoveryToolHandlers } from "../tools/discovery/handlers.js";
+import { deepSearchTool } from "../tools/discovery/deep-search-definitions.js";
+import { deepSearchHandlers } from "../tools/discovery/deep-search-handlers.js";
 import {
   readPageTool,
   retrievePageTool,
@@ -94,6 +96,7 @@ const toolHandlers: ToolHandlerMap = {
   ...pageToolHandlers,
   ...dataSourceToolHandlers,
   ...discoveryToolHandlers,
+  ...deepSearchHandlers,
 };
 
 export function getServerInstructions(): string {
@@ -133,6 +136,7 @@ export function getAllTools(): Tool[] {
     findTool,
     inspectDataSourceTool,
     searchTool,
+    deepSearchTool,
   ];
 }
 
