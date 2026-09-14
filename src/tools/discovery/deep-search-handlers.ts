@@ -174,9 +174,9 @@ export const deepSearchHandlers: ToolHandlerMap = {
                   snippet(block_fts, 4, '', '', '…', 20) as snippet,
                   bm25(block_fts, 0, 0, 0, 10.0, 1.0) as rank
            FROM block_fts WHERE block_fts MATCH ? ${typeClause}
-           ORDER BY rank LIMIT ?`,
+           ORDER BY rank`,
         )
-        .all(q, limit * 3) as FtsRow[];
+        .all(q) as FtsRow[];
 
       const pages = new Map<string, PageResult>();
 
