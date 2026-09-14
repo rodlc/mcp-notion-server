@@ -2,194 +2,230 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync, unlinkSync } from "node:fs";
 import type { ToolHandlerMap } from "../types.js";
 
-interface DeepSearchArgs {
-  query: string;
-  type?: "page" | "all";
-  limit?: number;
-}
-
-interface BlockRow {
-  id: string;
-  type: string;
-  properties: string | null;
-  parent_id: string;
-  last_edited_time: number;
-}
-
-interface MatchResult {
-  page_id: string;
-  title: string;
-  url: string;
-  matches: Array<{ block_type: string; snippet: string }>;
-  last_edited: string;
-}
-
-const NOTION_DB_PATH = join(
+const NOTION_DB = join(
   homedir(),
   "Library",
   "Application Support",
   "Notion",
   "notion.db",
 );
+const FTS_DB = join(
+  homedir(),
+  "Library",
+  "Application Support",
+  "Notion",
+  "notion_fts.db",
+);
+let cachedMtime = 0;
 
-function formatNotionId(raw: string): string {
-  const clean = raw.replace(/-/g, "");
-  if (clean.length !== 32) return raw;
-  return [
-    clean.slice(0, 8),
-    clean.slice(8, 12),
-    clean.slice(12, 16),
-    clean.slice(16, 20),
-    clean.slice(20),
-  ].join("-");
+function formatId(raw: string): string {
+  const c = raw.replace(/-/g, "");
+  if (c.length !== 32) return raw;
+  return `${c.slice(0, 8)}-${c.slice(8, 12)}-${c.slice(12, 16)}-${c.slice(16, 20)}-${c.slice(20)}`;
 }
 
-function createNotionUrl(pageId: string): string {
-  return `https://www.notion.so/${pageId.replace(/-/g, "")}`;
-}
-
-function extractTextFromProperties(properties: string | null): string {
-  if (!properties) return "";
+function extractText(props: string | null): string {
+  if (!props) return "";
   try {
-    const parsed = JSON.parse(properties);
     const texts: string[] = [];
-    for (const value of Object.values(parsed)) {
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          if (Array.isArray(item) && typeof item[0] === "string") {
+    for (const v of Object.values(JSON.parse(props)))
+      if (Array.isArray(v))
+        for (const item of v)
+          if (Array.isArray(item) && typeof item[0] === "string")
             texts.push(item[0]);
-          }
-        }
-      }
-    }
     return texts.join(" ");
   } catch {
     return "";
   }
 }
 
-function extractTitle(properties: string | null): string {
-  if (!properties) return "(untitled)";
+function extractTitle(props: string | null): string {
+  if (!props) return "(untitled)";
   try {
-    const parsed = JSON.parse(properties);
-    const titleProp = parsed.title;
-    if (Array.isArray(titleProp)) {
-      return titleProp.map((item: unknown[]) => (Array.isArray(item) ? item[0] : "")).join("");
-    }
-    return "(untitled)";
+    const t = JSON.parse(props).title;
+    return Array.isArray(t)
+      ? t.map((i: unknown[]) => (Array.isArray(i) ? i[0] : "")).join("")
+      : "(untitled)";
   } catch {
     return "(untitled)";
   }
 }
 
+function sanitizeQuery(query: string): string {
+  const tokens = query.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return '""';
+  return tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(" ");
+}
+
+type SourceRow = {
+  id: string;
+  type: string;
+  properties: string | null;
+  parent_id: string;
+};
+
+function buildFtsIndex(): void {
+  if (existsSync(FTS_DB)) unlinkSync(FTS_DB);
+  const src = new Database(NOTION_DB, { readonly: true });
+  const fts = new Database(FTS_DB);
+  fts.exec("PRAGMA journal_mode=WAL");
+  fts.exec(`CREATE VIRTUAL TABLE block_fts USING fts5(
+    block_id UNINDEXED, type UNINDEXED, parent_id UNINDEXED,
+    title, content, tokenize="unicode61"
+  )`);
+  const rows = src
+    .query(
+      "SELECT id, type, properties, parent_id FROM block WHERE alive = 1",
+    )
+    .all() as SourceRow[];
+  const ins = fts.prepare("INSERT INTO block_fts VALUES (?, ?, ?, ?, ?)");
+  fts.transaction(() => {
+    for (const r of rows) {
+      const title = r.type === "page" ? extractTitle(r.properties) : "";
+      const content = extractText(r.properties);
+      if (title || content)
+        ins.run(r.id, r.type, r.parent_id, title, content);
+    }
+  })();
+  src.close();
+  fts.close();
+  cachedMtime = statSync(NOTION_DB).mtimeMs;
+}
+
+function ensureFtsIndex(): void {
+  if (
+    !existsSync(FTS_DB) ||
+    statSync(NOTION_DB).mtimeMs !== cachedMtime
+  )
+    buildFtsIndex();
+}
+
+function resolveParentPage(
+  db: Database,
+  parentId: string,
+): SourceRow | null {
+  const stmt = db.prepare(
+    "SELECT id, type, properties, parent_id FROM block WHERE id = ? AND alive = 1",
+  );
+  let id = parentId;
+  for (let i = 0; i < 10; i++) {
+    const row = stmt.get(id) as SourceRow | null;
+    if (!row) return null;
+    if (row.type === "page") return row;
+    id = row.parent_id;
+  }
+  return null;
+}
+
+type FtsRow = {
+  block_id: string;
+  type: string;
+  parent_id: string;
+  title: string;
+  snippet: string;
+  rank: number;
+};
+type PageResult = {
+  page_id: string;
+  title: string;
+  url: string;
+  matches: { block_type: string; snippet: string }[];
+  relevance_score: number;
+};
+
 export const deepSearchHandlers: ToolHandlerMap = {
   async notion_deep_search(toolArguments) {
-    const args = toolArguments as unknown as DeepSearchArgs;
-
-    if (!args.query || args.query.trim().length === 0) {
+    const args = toolArguments as unknown as {
+      query: string;
+      type?: string;
+      limit?: number;
+    };
+    if (!args.query?.trim())
       throw new Error("Missing required argument: query");
-    }
-
-    if (!existsSync(NOTION_DB_PATH)) {
+    if (!existsSync(NOTION_DB))
       return {
         error: "Notion desktop cache not found",
-        message: `Expected SQLite database at: ${NOTION_DB_PATH}. Install and open Notion desktop app to enable deep search.`,
+        message: `Expected: ${NOTION_DB}. Open Notion desktop to enable deep search.`,
       };
-    }
 
     const limit = Math.min(args.limit ?? 20, 100);
-    const db = new Database(NOTION_DB_PATH, { readonly: true });
+    ensureFtsIndex();
+    const fts = new Database(FTS_DB, { readonly: true });
+    const notion = new Database(NOTION_DB, { readonly: true });
 
     try {
-      const typeFilter =
-        args.type === "page" ? "AND type = 'page'" : "";
+      const q = sanitizeQuery(args.query);
+      const typeClause = args.type === "page" ? "AND type = 'page'" : "";
 
-      const stmt = db.prepare(
-        `SELECT id, type, properties, parent_id, last_edited_time
-         FROM block
-         WHERE alive = 1
-           AND properties LIKE '%' || ? || '%' COLLATE NOCASE
-           ${typeFilter}
-         ORDER BY last_edited_time DESC
-         LIMIT ?`,
-      );
+      const total = (
+        fts
+          .query(
+            `SELECT COUNT(*) as n FROM block_fts WHERE block_fts MATCH ? ${typeClause}`,
+          )
+          .get(q) as { n: number }
+      ).n;
 
-      const rows = stmt.all(args.query, limit * 3) as BlockRow[];
+      const rows = fts
+        .query(
+          `SELECT block_id, type, parent_id, title,
+                  snippet(block_fts, 4, '', '', '…', 20) as snippet,
+                  bm25(block_fts, 0, 0, 0, 10.0, 1.0) as rank
+           FROM block_fts WHERE block_fts MATCH ? ${typeClause}
+           ORDER BY rank LIMIT ?`,
+        )
+        .all(q, limit * 3) as FtsRow[];
 
-      const pageMap = new Map<string, MatchResult>();
+      const pages = new Map<string, PageResult>();
 
-      for (const row of rows) {
-        const text = extractTextFromProperties(row.properties);
-        if (!text.toLowerCase().includes(args.query.toLowerCase())) continue;
-
-        const snippetStart = Math.max(
-          0,
-          text.toLowerCase().indexOf(args.query.toLowerCase()) - 40,
-        );
-        const snippet = text.slice(snippetStart, snippetStart + 120).trim();
-
+      for (const r of rows) {
         let pageId: string;
         let pageTitle: string;
-
-        if (row.type === "page") {
-          pageId = formatNotionId(row.id);
-          pageTitle = extractTitle(row.properties);
+        if (r.type === "page") {
+          pageId = formatId(r.block_id);
+          pageTitle = r.title || "(untitled)";
         } else {
-          const parentPage = resolveParentPage(db, row.parent_id, 10);
-          if (!parentPage) continue;
-          pageId = formatNotionId(parentPage.id);
-          pageTitle = extractTitle(parentPage.properties);
+          const parent = resolveParentPage(notion, r.parent_id);
+          if (!parent) continue;
+          pageId = formatId(parent.id);
+          pageTitle = extractTitle(parent.properties);
         }
-
-        const existing = pageMap.get(pageId);
+        const existing = pages.get(pageId);
         if (existing) {
-          if (existing.matches.length < 5) {
-            existing.matches.push({ block_type: row.type, snippet });
-          }
+          if (existing.matches.length < 5)
+            existing.matches.push({
+              block_type: r.type,
+              snippet: r.snippet,
+            });
+          if (r.rank < existing.relevance_score)
+            existing.relevance_score = r.rank;
         } else {
-          pageMap.set(pageId, {
+          pages.set(pageId, {
             page_id: pageId,
             title: pageTitle,
-            url: createNotionUrl(pageId),
-            matches: [{ block_type: row.type, snippet }],
-            last_edited: row.last_edited_time
-              ? new Date(row.last_edited_time).toISOString()
-              : "",
+            url: `https://www.notion.so/${pageId.replace(/-/g, "")}`,
+            matches: [{ block_type: r.type, snippet: r.snippet }],
+            relevance_score: r.rank,
           });
         }
-
-        if (pageMap.size >= limit) break;
+        if (pages.size >= limit) break;
       }
 
       return {
         object: "deep_search_results",
         query: args.query,
-        result_count: pageMap.size,
-        results: Array.from(pageMap.values()),
+        result_count: pages.size,
+        total_matches: total,
+        has_more: pages.size >= limit,
+        results: [...pages.values()].sort(
+          (a, b) => a.relevance_score - b.relevance_score,
+        ),
       };
     } finally {
-      db.close();
+      fts.close();
+      notion.close();
     }
   },
 };
-
-function resolveParentPage(
-  db: Database,
-  parentId: string,
-  maxDepth: number,
-): BlockRow | null {
-  const stmt = db.prepare(
-    "SELECT id, type, properties, parent_id, last_edited_time FROM block WHERE id = ? AND alive = 1",
-  );
-  let currentId = parentId;
-  for (let i = 0; i < maxDepth; i++) {
-    const row = stmt.get(currentId) as BlockRow | null;
-    if (!row) return null;
-    if (row.type === "page") return row;
-    currentId = row.parent_id;
-  }
-  return null;
-}
