@@ -26,6 +26,12 @@ export const deepSearchTool: Tool = {
         type: "number",
         description: "Maximum number of results (default: 20)",
       },
+      sort: {
+        type: "string",
+        enum: ["relevance", "date"],
+        description:
+          "Sort order: 'relevance' (BM25 ranking, default) or 'date' (chronological oldest-first, useful for timeline reconstruction)",
+      },
     },
     required: ["query"],
   },

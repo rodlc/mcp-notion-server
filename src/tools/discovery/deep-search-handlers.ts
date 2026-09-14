@@ -65,6 +65,7 @@ type SourceRow = {
   type: string;
   properties: string | null;
   parent_id: string;
+  last_edited_time: number;
 };
 
 function buildFtsIndex(): void {
@@ -74,20 +75,21 @@ function buildFtsIndex(): void {
   fts.exec("PRAGMA journal_mode=WAL");
   fts.exec(`CREATE VIRTUAL TABLE block_fts USING fts5(
     block_id UNINDEXED, type UNINDEXED, parent_id UNINDEXED,
+    last_edited_time UNINDEXED,
     title, content, tokenize="unicode61"
   )`);
   const rows = src
     .query(
-      "SELECT id, type, properties, parent_id FROM block WHERE alive = 1",
+      "SELECT id, type, properties, parent_id, last_edited_time FROM block WHERE alive = 1",
     )
     .all() as SourceRow[];
-  const ins = fts.prepare("INSERT INTO block_fts VALUES (?, ?, ?, ?, ?)");
+  const ins = fts.prepare("INSERT INTO block_fts VALUES (?, ?, ?, ?, ?, ?)");
   fts.transaction(() => {
     for (const r of rows) {
       const title = r.type === "page" ? extractTitle(r.properties) : "";
       const content = extractText(r.properties);
       if (title || content)
-        ins.run(r.id, r.type, r.parent_id, title, content);
+        ins.run(r.id, r.type, r.parent_id, r.last_edited_time ?? 0, title, content);
     }
   })();
   src.close();
@@ -108,7 +110,7 @@ function resolveParentPage(
   parentId: string,
 ): SourceRow | null {
   const stmt = db.prepare(
-    "SELECT id, type, properties, parent_id FROM block WHERE id = ? AND alive = 1",
+    "SELECT id, type, properties, parent_id, last_edited_time FROM block WHERE id = ? AND alive = 1",
   );
   let id = parentId;
   for (let i = 0; i < 10; i++) {
@@ -124,6 +126,7 @@ type FtsRow = {
   block_id: string;
   type: string;
   parent_id: string;
+  last_edited_time: number;
   title: string;
   snippet: string;
   rank: number;
@@ -132,6 +135,7 @@ type PageResult = {
   page_id: string;
   title: string;
   url: string;
+  last_edited: string;
   matches: { block_type: string; snippet: string }[];
   relevance_score: number;
 };
@@ -142,6 +146,7 @@ export const deepSearchHandlers: ToolHandlerMap = {
       query: string;
       type?: string;
       limit?: number;
+      sort?: string;
     };
     if (!args.query?.trim())
       throw new Error("Missing required argument: query");
@@ -168,13 +173,15 @@ export const deepSearchHandlers: ToolHandlerMap = {
           .get(q) as { n: number }
       ).n;
 
+      const orderClause =
+        args.sort === "date" ? "ORDER BY last_edited_time ASC" : "ORDER BY rank";
       const rows = fts
         .query(
-          `SELECT block_id, type, parent_id, title,
-                  snippet(block_fts, 4, '', '', '…', 20) as snippet,
-                  bm25(block_fts, 0, 0, 0, 10.0, 1.0) as rank
+          `SELECT block_id, type, parent_id, last_edited_time, title,
+                  snippet(block_fts, 5, '', '', '…', 20) as snippet,
+                  bm25(block_fts, 0, 0, 0, 0, 10.0, 1.0) as rank
            FROM block_fts WHERE block_fts MATCH ? ${typeClause}
-           ORDER BY rank`,
+           ${orderClause}`,
         )
         .all(q) as FtsRow[];
 
@@ -183,6 +190,7 @@ export const deepSearchHandlers: ToolHandlerMap = {
       for (const r of rows) {
         let pageId: string;
         let pageTitle: string;
+        let pageTime = r.last_edited_time;
         if (r.type === "page") {
           pageId = formatId(r.block_id);
           pageTitle = r.title || "(untitled)";
@@ -191,7 +199,11 @@ export const deepSearchHandlers: ToolHandlerMap = {
           if (!parent) continue;
           pageId = formatId(parent.id);
           pageTitle = extractTitle(parent.properties);
+          if (parent.last_edited_time) pageTime = parent.last_edited_time;
         }
+        const edited = pageTime
+          ? new Date(pageTime).toISOString()
+          : "";
         const existing = pages.get(pageId);
         if (existing) {
           if (existing.matches.length < 5)
@@ -206,6 +218,7 @@ export const deepSearchHandlers: ToolHandlerMap = {
             page_id: pageId,
             title: pageTitle,
             url: `https://www.notion.so/${pageId.replace(/-/g, "")}`,
+            last_edited: edited,
             matches: [{ block_type: r.type, snippet: r.snippet }],
             relevance_score: r.rank,
           });
@@ -213,15 +226,21 @@ export const deepSearchHandlers: ToolHandlerMap = {
         if (pages.size >= limit) break;
       }
 
+      const sortFn =
+        args.sort === "date"
+          ? (a: PageResult, b: PageResult) =>
+              a.last_edited.localeCompare(b.last_edited)
+          : (a: PageResult, b: PageResult) =>
+              a.relevance_score - b.relevance_score;
+
       return {
         object: "deep_search_results",
         query: args.query,
+        sort: args.sort ?? "relevance",
         result_count: pages.size,
         total_matches: total,
         has_more: pages.size >= limit,
-        results: [...pages.values()].sort(
-          (a, b) => a.relevance_score - b.relevance_score,
-        ),
+        results: [...pages.values()].sort(sortFn),
       };
     } finally {
       fts.close();
